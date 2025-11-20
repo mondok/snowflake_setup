@@ -8,6 +8,8 @@ See config.yaml for structure.
 
 import sys
 import time
+import smtplib
+from email.message import EmailMessage
 import yaml
 import snowflake.connector
 from snowflake.connector.errors import ProgrammingError
@@ -182,7 +184,7 @@ def ensure_reader_user(cur, user_cfg: dict, default_wh: str):
     """
     if not user_cfg:
         log("No reader_user section in config; skipping user creation.")
-        return
+        return {"created": False}
 
     name = user_cfg["name"]
     email = user_cfg["email"]
@@ -207,7 +209,7 @@ def ensure_reader_user(cur, user_cfg: dict, default_wh: str):
               EMAIL = '{email}'
         """)
         log(f"User '{name}' created with email {email}.")
-        return
+        return {"created": True, "name": name, "email": email, "temp_password": temp_pw}
 
     # User exists: update metadata but do not reset password
     log(f"User '{name}' already exists. Updating email and default warehouse...")
@@ -218,6 +220,69 @@ def ensure_reader_user(cur, user_cfg: dict, default_wh: str):
               DEFAULT_ROLE = 'PUBLIC'
     """)
     log(f"User '{name}' updated (EMAIL={email}, DEFAULT_WAREHOUSE={default_wh}).")
+    return {"created": False, "name": name, "email": email}
+
+
+def send_credentials_email(user_name: str, user_email: str, temp_password: str, login_url: str, smtp_cfg: dict) -> None:
+    """
+    Send the reader's initial credentials via email using SMTP settings from config.
+
+    smtp_cfg expected keys (optional defaults in parentheses):
+      - host (required)
+      - port (587 if use_tls True, else 25; 465 if use_ssl True)
+      - user (optional)
+      - password (optional)
+      - from (optional, falls back to user or 'no-reply@snowflake')
+      - use_tls (bool, default True)
+      - use_ssl (bool, default False)
+    """
+    if not smtp_cfg or not smtp_cfg.get("host"):
+        log("SMTP config missing or incomplete; skipping email notification.")
+        return
+
+    use_ssl = bool(smtp_cfg.get("use_ssl", False))
+    use_tls = bool(smtp_cfg.get("use_tls", True)) if not use_ssl else False
+    host = smtp_cfg["host"]
+    port = smtp_cfg.get("port")
+    if port is None:
+        port = 465 if use_ssl else (587 if use_tls else 25)
+    username = smtp_cfg.get("user")
+    password = smtp_cfg.get("password")
+    from_addr = smtp_cfg.get("from") or username or "no-reply@snowflake"
+
+    subject = "Your Snowflake Reader Account Credentials"
+    body = (
+        "Hello,\n\n"
+        f"Your Snowflake reader account has been provisioned.\n\n"
+        f"Login URL: {login_url}\n"
+        f"Username: {user_name}\n"
+        f"Temporary Password: {temp_password}\n\n"
+        "You will be prompted to change your password on first login.\n\n"
+        "If you did not expect this email, please contact the sender.\n"
+    )
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = from_addr
+    msg["To"] = user_email
+    msg.set_content(body)
+
+    try:
+        if use_ssl:
+            server = smtplib.SMTP_SSL(host, port)
+        else:
+            server = smtplib.SMTP(host, port)
+        with server:
+            server.ehlo()
+            if use_tls and not use_ssl:
+                server.starttls()
+                server.ehlo()
+            if username and password:
+                server.login(username, password)
+            server.send_message(msg)
+        log(f"Credentials email sent to {user_email}.")
+    except Exception as e:
+        log(f"WARNING: Failed to send credentials email to {user_email}: {e}")
 
 
 # ---------- main ----------
@@ -366,7 +431,22 @@ def main():
         )
 
         # 8. Ensure a real user exists in reader account
-        ensure_reader_user(reader_cur, reader_user_cfg, reader_wh_name)
+        user_result = ensure_reader_user(reader_cur, reader_user_cfg, reader_wh_name)
+
+        # 8b. If created, email credentials (if SMTP config provided)
+        if user_result and user_result.get("created"):
+            smtp_cfg = cfg.get("smtp") or {}
+            try:
+                send_credentials_email(
+                    user_name=user_result["name"],
+                    user_email=user_result["email"],
+                    temp_password=user_result["temp_password"],
+                    login_url=account_url,
+                    smtp_cfg=smtp_cfg,
+                )
+            except Exception as e:
+                # Be resilient: email failures should not abort provisioning
+                log(f"WARNING: Error during email dispatch: {e}")
 
         # 9. Test query
         log("Running test query in reader account...")
