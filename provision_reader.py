@@ -310,8 +310,27 @@ def main():
 
     provider_db = data_cfg["provider_database"]
     shared_schema = data_cfg["shared_schema"]
-    shared_view_name = data_cfg["shared_view_name"]
-    source_table = data_cfg["source_table"]
+    # Support multiple source tables/views via data.objects list, with backward compatibility
+    objects_cfg = data_cfg.get("objects")
+    if isinstance(objects_cfg, list) and objects_cfg:
+        objects = objects_cfg
+    else:
+        # Fallback to single keys for backward compatibility
+        objects = [
+            {
+                "shared_view_name": data_cfg["shared_view_name"],
+                "source_table": data_cfg["source_table"],
+                "view_where": data_cfg.get("view_where"),
+            }
+        ]
+
+    def normalize_where(where_val):
+        where_val = (where_val or "").strip()
+        if not where_val:
+            return ""
+        if not where_val.lower().lstrip().startswith("where "):
+            return f"WHERE {where_val}"
+        return where_val
 
     # ------------- connect to provider -------------
 
@@ -339,18 +358,24 @@ def main():
         provider_share_account_id = provider_cur.fetchone()[0]
         log(f"Provider share account identifier (CURRENT_ACCOUNT) = {provider_share_account_id}")
 
-        # 1. Create schema + secure view
-        log("Ensuring shared schema and secure view exist...")
+        # 1. Create schema + secure views
+        log("Ensuring shared schema and secure view(s) exist...")
 
         provider_cur.execute(f"CREATE SCHEMA IF NOT EXISTS {provider_db}.{shared_schema}")
 
-        provider_cur.execute(f"""
-            CREATE OR REPLACE SECURE VIEW {provider_db}.{shared_schema}.{shared_view_name} AS
-            SELECT *
-            FROM {provider_db}.PUBLIC.{source_table}
-            WHERE NPI IS NOT NULL
-        """)
-        log(f"Secure view {provider_db}.{shared_schema}.{shared_view_name} is ready.")
+        for obj in objects:
+            sv_name = obj["shared_view_name"]
+            src_table = obj["source_table"]
+            view_where_sql = normalize_where(obj.get("view_where"))
+            provider_cur.execute(
+                (
+                    f"CREATE OR REPLACE SECURE VIEW {provider_db}.{shared_schema}.{sv_name} AS\n"
+                    f"SELECT *\n"
+                    f"FROM {provider_db}.PUBLIC.{src_table}\n"
+                    + (f"{view_where_sql}\n" if view_where_sql else "")
+                )
+            )
+            log(f"Secure view {provider_db}.{shared_schema}.{sv_name} is ready.")
 
         # 2. Create share + grants
         log(f"Ensuring share {share_name} exists with proper grants...")
@@ -358,10 +383,12 @@ def main():
 
         provider_cur.execute(f"GRANT USAGE ON DATABASE {provider_db} TO SHARE {share_name}")
         provider_cur.execute(f"GRANT USAGE ON SCHEMA {provider_db}.{shared_schema} TO SHARE {share_name}")
-        provider_cur.execute(
-            f"GRANT SELECT ON VIEW {provider_db}.{shared_schema}.{shared_view_name} "
-            f"TO SHARE {share_name}"
-        )
+        # Grant SELECT on each view to the share
+        for obj in objects:
+            sv_name = obj["shared_view_name"]
+            provider_cur.execute(
+                f"GRANT SELECT ON VIEW {provider_db}.{shared_schema}.{sv_name} TO SHARE {share_name}"
+            )
         log("Share and privileges ensured.")
 
         # 3. Ensure managed account exists + get info (name, locator, url)
@@ -454,9 +481,12 @@ def main():
         reader_cur.execute(f"USE DATABASE {reader_db_name}")
         reader_cur.execute(f"USE SCHEMA {shared_schema}")
 
-        reader_cur.execute(f"SELECT COUNT(*) FROM {shared_view_name}")
-        count = reader_cur.fetchone()[0]
-        log(f"Test query OK. Row count from view {shared_view_name}: {count}")
+        # Run a simple COUNT(*) against each shared view
+        for obj in objects:
+            sv_name = obj["shared_view_name"]
+            reader_cur.execute(f"SELECT COUNT(*) FROM {sv_name}")
+            count = reader_cur.fetchone()[0]
+            log(f"Test query OK. Row count from view {sv_name}: {count}")
 
     finally:
         reader_cur.close()
